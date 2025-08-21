@@ -3,14 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Mini Runner v0.2</title>
-  <link rel="preload" href="game.js" as="script">
-  <link rel="stylesheet" href="style.css">
+  <title>Mini Runner – Autoscan v1</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#87c5ff; -webkit-user-select:none; user-select:none; }
+    #game { display:block; width:100vw; height:100vh; touch-action:none; background:linear-gradient(#87c5ff 70%, #9ad1ff 100%); }
+    .controls { position:fixed; left:0; right:0; bottom:0; pointer-events:none; padding: env(safe-area-inset-bottom, 8px) 12px 12px; display:flex; justify-content:space-between; gap:12px; }
+    .leftpad,.rightpad{ display:flex; gap:12px; pointer-events:auto; }
+    .btn{ width:64px; height:64px; border-radius:16px; border:2px solid rgba(0,0,0,.2); background:rgba(255,255,255,.35); backdrop-filter:blur(6px);
+      display:grid; place-items:center; font:700 18px/1 system-ui, -apple-system, Segoe UI, Roboto; color:#14385b; box-shadow:0 6px 16px rgba(0,0,0,.15); touch-action:manipulation; }
+    .btn.small{ width:56px; height:56px; }
+    @media (min-width: 900px){ .controls{ display:none; } }
+    .hint{ position:fixed; top:10px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.3); color:#fff; padding:6px 10px; border-radius:8px; font:500 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto; }
+  </style>
 </head>
 <body>
   <canvas id="game"></canvas>
-
-  <!-- Mobile controls -->
   <div class="controls" id="controls">
     <div class="leftpad">
       <button class="btn" id="leftBtn" aria-label="Влево">⟵</button>
@@ -21,9 +28,349 @@
       <button class="btn small" id="shootBtn" aria-label="Выстрел">⦿</button>
     </div>
   </div>
+  <div class="hint" id="hint">Десктоп: ф/в или ←/→ — ходьба, ПРОБЕЛ — прыжок, ENTER — выстрел. R — рестарт</div>
 
-  <div class="hint" id="hint">Десктоп: ф/в или ←/→ — идти, ПРОБЕЛ — прыжок, ENTER — выстрел</div>
+  <script>
+  (() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
 
-  <script src="game.js"></script>
+    // ====== TUNABLES ======
+    const SCROLL_SPEED = 140;
+    const PLAYER_SPEED = 230;
+    const JUMP_V = -520;
+    const GRAVITY = 1500;
+    const POLICE_COUNT = 3;
+    const LEFT_KILL_MARGIN = 28;
+    const BIN_MIN_GAP = 480;
+    const BIN_MAX_GAP = 780;
+    const BIN_SIZE = { w: 56, h: 36 };
+
+    // ====== STATE ======
+    const state = {
+      w: 0, h: 0, dpr: Math.max(1, Math.min(window.devicePixelRatio || 1, 2)),
+      keys: { left: false, right: false, jump: false, shoot: false },
+      groundY: 0,
+      lastTime: 0,
+      cameraX: 0,
+      levelScroll: 0,
+      gameOver: false,
+      bustedTimer: 0
+    };
+
+    function resize() {
+      state.dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+      state.w = Math.floor(window.innerWidth);
+      state.h = Math.floor(window.innerHeight);
+      canvas.width = state.w * state.dpr;
+      canvas.height = state.h * state.dpr;
+      canvas.style.width = state.w + 'px';
+      canvas.style.height = state.h + 'px';
+      ctx.setTransform(state.dpr, 0, 0, state.dpr, 0, 0);
+      state.groundY = Math.floor(state.h * 0.8);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ====== PLAYER ======
+    const player = {
+      x: 120, y: 0, w: 40, h: 54,
+      vx: 0, vy: 0,
+      maxVy: 900,
+      onGround: false,
+      facing: 1,
+      shootCooldown: 0
+    };
+
+    const bullets = [];
+
+    // ====== POLICE ======
+    const police = Array.from({ length: POLICE_COUNT }, (_, i) => ({
+      x: 0, y: 0, w: 38, h: 52, phase: Math.random() * Math.PI * 2, idx: i
+    }));
+
+    function updatePolicePositions() {
+      const leftEdge = state.cameraX + 6;
+      const spacing = 44;
+      police.forEach((p, i) => {
+        p.x = leftEdge + i * spacing;
+        p.y = state.groundY - p.h;
+        p.phase += 0.16;
+      });
+    }
+
+    // ====== BINS ======
+    const bins = [];
+    let nextBinAt = 400;
+
+    function trySpawnBins() {
+      const needAhead = state.cameraX + state.w * 2;
+      while (nextBinAt < needAhead) {
+        bins.push({ x: nextBinAt, y: state.groundY - BIN_SIZE.h, w: BIN_SIZE.w, h: BIN_SIZE.h });
+        const gap = BIN_MIN_GAP + Math.random() * (BIN_MAX_GAP - BIN_MIN_GAP);
+        nextBinAt += gap;
+      }
+      while (bins.length && bins[0].x + bins[0].w < state.cameraX - 200) bins.shift();
+    }
+
+    // ====== INPUT ======
+    function setKey(name, pressed){ state.keys[name] = pressed; }
+    const LEFT_KEYS = new Set(['ArrowLeft','a','A','ф','Ф']);
+    const RIGHT_KEYS = new Set(['ArrowRight','d','D','в','В']);
+
+    window.addEventListener('keydown', (e) => {
+      if (state.gameOver && (e.key === 'r' || e.key === 'R' || e.code === 'Space' || e.code === 'Enter')) { restart(); return; }
+      if (LEFT_KEYS.has(e.key)) { setKey('left', true); e.preventDefault(); }
+      if (RIGHT_KEYS.has(e.key)) { setKey('right', true); e.preventDefault(); }
+      if (e.code === 'Space') { setKey('jump', true); e.preventDefault(); }
+      if (e.code === 'Enter') { setKey('shoot', true); e.preventDefault(); }
+    }, { passive: false });
+
+    window.addEventListener('keyup', (e) => {
+      if (LEFT_KEYS.has(e.key)) { setKey('left', false); e.preventDefault(); }
+      if (RIGHT_KEYS.has(e.key)) { setKey('right', false); e.preventDefault(); }
+      if (e.code === 'Space') { setKey('jump', false); e.preventDefault(); }
+      if (e.code === 'Enter') { setKey('shoot', false); e.preventDefault(); }
+    }, { passive: false });
+
+    function bindButton(id, key){
+      const el = document.getElementById(id);
+      const press = (ev) => {
+        if (state.gameOver) { restart(); return; }
+        setKey(key, true); ev.preventDefault();
+      };
+      const release = (ev) => { setKey(key, false); ev.preventDefault(); };
+      ['pointerdown','touchstart','mousedown'].forEach(t => el.addEventListener(t, press, { passive:false }));
+      ['pointerup','pointercancel','touchend','touchcancel','mouseup','mouseleave'].forEach(t => el.addEventListener(t, release, { passive:false }));
+    }
+    bindButton('leftBtn', 'left');
+    bindButton('rightBtn', 'right');
+    bindButton('jumpBtn', 'jump');
+    bindButton('shootBtn', 'shoot');
+
+    if (/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent))
+      document.getElementById('hint').style.display = 'none';
+
+    function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+    function aabb(a, b){ return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+    let dtGlobal = 0;
+    function frame(t){
+      if (!state.lastTime) state.lastTime = t;
+      dtGlobal = Math.min((t - state.lastTime) / 1000, 1/30);
+      state.lastTime = t;
+
+      if (!state.gameOver) { update(dtGlobal); render(); }
+      else { render(); }
+
+      requestAnimationFrame(frame);
+    }
+
+    function update(dt){
+      state.cameraX += SCROLL_SPEED * dt;
+      state.levelScroll = state.cameraX;
+
+      if (state.keys.left && !state.keys.right) { player.vx = -PLAYER_SPEED; player.facing = -1; }
+      else if (state.keys.right && !state.keys.left) { player.vx = PLAYER_SPEED; player.facing = 1; }
+      else { player.vx *= 0.86; if (Math.abs(player.vx) < 5) player.vx = 0; }
+
+      if (state.keys.jump && player.onGround) { player.vy = JUMP_V; player.onGround = false; }
+
+      if (state.keys.shoot && player.shootCooldown <= 0) {
+        bullets.push({ x: player.x + player.w/2 + player.facing*22, y: player.y + player.h*0.45, r: 5, vx: 520 * player.facing, life: 1.6 });
+        player.shootCooldown = 0.22;
+      }
+      if (player.shootCooldown > 0) player.shootCooldown -= dt;
+
+      player.vy += GRAVITY * dt;
+      player.vy = clamp(player.vy, -2000, player.maxVy);
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+      player.onGround = false;
+
+      const groundTop = state.groundY - player.h;
+      if (player.y >= groundTop) { player.y = groundTop; player.vy = 0; player.onGround = true; }
+
+      trySpawnBins();
+      for (const bin of bins) { if (aabb(player, bin)) { 
+        const fromTop = player.y + player.h <= bin.y + 10 && player.vy >= 0;
+        if (fromTop) { player.y = bin.y - player.h; player.vy = 0; player.onGround = true; }
+        else {
+          if (player.x + player.w/2 < bin.x + bin.w/2) player.x = bin.x - player.w; else player.x = bin.x + bin.w;
+          player.vx = 0;
+        }
+      } }
+
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.vx * dt; b.life -= dt;
+        if (b.life <= 0 || b.x < state.cameraX - 200 || b.x > state.cameraX + state.w + 200) bullets.splice(i, 1);
+      }
+
+      updatePolicePositions();
+      if (player.x < state.cameraX + LEFT_KILL_MARGIN) return busted();
+      for (const cop of police) if (aabb(player, cop)) return busted();
+    }
+
+    function busted() { state.gameOver = true; state.bustedTimer = 0; }
+    function restart() {
+      state.gameOver = false; state.cameraX = 0; state.levelScroll = 0; state.lastTime = 0;
+      player.x = 120; player.y = state.groundY - player.h; player.vx = 0; player.vy = 0; player.onGround = true; player.facing = 1;
+      bullets.length = 0; bins.length = 0; nextBinAt = 400;
+    }
+
+    function render(){
+      ctx.clearRect(0,0,state.w,state.h);
+      drawBackground();
+      ctx.save(); ctx.translate(-state.cameraX, 0);
+      drawBins(); drawPlayer(); drawPolice(); drawBullets();
+      ctx.restore();
+      if (state.gameOver) drawBustedOverlay();
+    }
+
+    function drawBackground() {
+      const w = state.w, h = state.h, gY = state.groundY;
+
+      // mid skyline (parallax)
+      ctx.save();
+      ctx.translate(-(state.levelScroll*0.5) % 800, 0);
+      drawCityStrip(0, h*0.35, 800, h*0.45, '#6aa0c9');
+      ctx.restore();
+
+      // near skyline
+      ctx.save();
+      ctx.translate(-(state.levelScroll*0.8) % 600, 0);
+      drawCityStrip(0, h*0.45, 600, h*0.55, '#4e84ac');
+      ctx.restore();
+
+      // asphalt
+      ctx.fillStyle = '#3d3d3d';
+      ctx.fillRect(0, gY, w, h - gY);
+      ctx.strokeStyle = '#e7e7e7';
+      ctx.lineWidth = 4;
+      const dashW = 28, gap = 20; let offset = (-state.levelScroll*1.2) % (dashW+gap);
+      ctx.setLineDash([dashW, gap]);
+      ctx.beginPath(); ctx.moveTo(offset, gY + 26); ctx.lineTo(w + dashW, gY + 26); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function drawCityStrip(x, y, stripW, stripH, color){
+      const w = state.w; ctx.fillStyle = color;
+      let s = 12345;
+      const rand = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+      for (let i = -1; i < Math.ceil((w/stripW))+2; i++) {
+        const baseX = x + i*stripW;
+        for (let b = 0; b < 10; b++) {
+          const bw = 30 + rand()*40;
+          const bh = stripH*0.3 + rand()*stripH*0.5;
+          const bx = baseX + b*(stripW/10) + rand()*10;
+          const by = y + (stripH - bh);
+          ctx.fillRect(bx, by, bw, bh);
+          ctx.fillStyle = 'rgba(255,255,255,0.08)';
+          const rows = Math.floor(bh/18), cols = Math.floor(bw/14);
+          for (let r = 1; r < rows; r++) for (let c = 1; c < cols; c++) {
+            ctx.fillRect(bx + c*12, by + r*14, 4, 6);
+          }
+          ctx.fillStyle = color;
+        }
+      }
+    }
+
+    function drawPlayer(){
+      const p = player;
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.beginPath(); ctx.ellipse(p.x + p.w/2, state.groundY + 6, p.w*0.45, 6, 0, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#263238';
+      ctx.fillRect(p.x + 10, p.y + p.h - 20, 10, 20);
+      ctx.fillRect(p.x + p.w - 20, p.y + p.h - 20, 10, 20);
+      ctx.fillStyle = '#1976d2';
+      ctx.fillRect(p.x + 6, p.y + 18, p.w - 12, 28);
+      ctx.fillStyle = '#ffddb0';
+      ctx.beginPath(); ctx.arc(p.x + p.w/2, p.y + 14, 12, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#0b2540';
+      const eyeX = p.x + p.w/2 + (p.vx >= 0 ? 4 : -8);
+      ctx.fillRect(eyeX, p.y + 10, 4, 4);
+      ctx.fillStyle = '#ffddb0';
+      const armX = p.x + (p.vx >= 0 ? p.w - 8 : 8);
+      ctx.fillRect(armX - 6, p.y + 26, 12, 6);
+      ctx.fillStyle = '#424242';
+      ctx.fillRect(armX + (p.vx >= 0 ? 2 : -8), p.y + 24, 8, 10);
+    }
+
+    function drawBullets(){
+      ctx.fillStyle = '#ffd54f';
+      bullets.forEach(b => {
+        ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 0.15; ctx.fillRect(b.x - b.vx*0.03, b.y-1, b.vx*0.03, 2); ctx.globalAlpha = 1;
+      });
+    }
+
+    function drawPolice(){
+      police.forEach((p, i) => {
+        const leg = Math.sin(p.phase + i) * 3;
+        ctx.fillStyle = 'rgba(0,0,0,0.22)';
+        ctx.beginPath(); ctx.ellipse(p.x + p.w/2, state.groundY + 6, p.w*0.42, 6, 0, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#303030';
+        ctx.fillRect(p.x + 10 + leg, p.y + p.h - 20, 9, 20);
+        ctx.fillRect(p.x + p.w - 20 - leg, p.y + p.h - 20, 9, 20);
+        ctx.fillStyle = '#1f5b95';
+        ctx.fillRect(p.x + 6, p.y + 18, p.w - 12, 28);
+        ctx.fillStyle = '#ffd4a3';
+        ctx.beginPath(); ctx.arc(p.x + p.w/2, p.y + 14, 12, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#163f66';
+        ctx.fillRect(p.x + p.w/2 - 12, p.y + 2, 24, 6);
+        ctx.fillStyle = '#2b2b2b';
+        ctx.fillRect(p.x + p.w - 6, p.y + 26, 14, 4);
+      });
+    }
+
+    function drawBins(){
+      ctx.fillStyle = '#6b6b6b';
+      bins.forEach(bin => {
+        ctx.fillRect(bin.x, bin.y, bin.w, bin.h);
+        ctx.fillStyle = '#545454';
+        ctx.fillRect(bin.x - 6, bin.y + 4, bin.w + 12, 6);
+        ctx.fillStyle = '#6b6b6b';
+      });
+    }
+
+    function drawBustedOverlay(){
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(0,0,state.w,state.h);
+      ctx.fillStyle = '#ff4444';
+      ctx.font = 'bold 64px system-ui, -apple-system, Segoe UI, Roboto';
+      ctx.textAlign = 'center';
+      ctx.fillText('BUSTED', state.w/2, state.h/2);
+      ctx.font = '500 16px system-ui, -apple-system, Segoe UI, Roboto';
+      ctx.fillStyle = '#fff';
+      ctx.fillText('Нажми R / Space / Enter или тапни для рестарта', state.w/2, state.h/2 + 40);
+    }
+
+    function drawCityStrip(x, y, stripW, stripH, color){
+      const w = state.w; ctx.fillStyle = color;
+      let s = 12345;
+      const rand = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+      for (let i = -1; i < Math.ceil((w/stripW))+2; i++) {
+        const baseX = x + i*stripW;
+        for (let b = 0; b < 10; b++) {
+          const bw = 30 + rand()*40;
+          const bh = stripH*0.3 + rand()*stripH*0.5;
+          const bx = baseX + b*(stripW/10) + rand()*10;
+          const by = y + (stripH - bh);
+          ctx.fillRect(bx, by, bw, bh);
+          ctx.fillStyle = 'rgba(255,255,255,0.08)';
+          const rows = Math.floor(bh/18), cols = Math.floor(bw/14);
+          for (let r = 1; r < rows; r++) for (let c = 1; c < cols; c++) {
+            ctx.fillRect(bx + c*12, by + r*14, 4, 6);
+          }
+          ctx.fillStyle = color;
+        }
+      }
+    }
+
+    player.y = state.groundY - player.h;
+    requestAnimationFrame(frame);
+  })();
+  </script>
 </body>
 </html>
