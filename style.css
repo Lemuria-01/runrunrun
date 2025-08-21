@@ -1,0 +1,35 @@
+/* Global */
+html, body {
+  margin: 0; height: 100%; overflow: hidden; background: #87c5ff; /* sky */
+  -webkit-touch-callout: none; -webkit-user-select: none; -ms-user-select: none; user-select: none;
+}
+#game {
+  display: block; width: 100vw; height: 100vh; touch-action: none;
+  background: linear-gradient(#87c5ff 70%, #9ad1ff 100%);
+}
+
+/* Mobile controls */
+.controls {
+  position: fixed; left: 0; right: 0; bottom: 0; pointer-events: none;
+  padding: env(safe-area-inset-bottom, 8px) 12px 12px; display: flex; justify-content: space-between; gap: 12px;
+}
+.leftpad, .rightpad { display: flex; gap: 12px; pointer-events: auto; }
+.btn {
+  width: 64px; height: 64px; border-radius: 16px; border: 2px solid rgba(0,0,0,.2);
+  background: rgba(255,255,255,.35); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  display: grid; place-items: center; font: 700 18px/1 system-ui, -apple-system, Segoe UI, Roboto; color: #14385b;
+  box-shadow: 0 6px 16px rgba(0,0,0,.15); touch-action: manipulation;
+}
+.btn:active { transform: translateY(1px); }
+.btn.small { width: 56px; height: 56px; }
+
+/* Hide mobile controls on wide screens */
+@media (min-width: 900px) {
+  .controls { display: none; }
+}
+
+.hint {
+  position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+  background: rgba(0,0,0,.3); color: #fff; padding: 6px 10px; border-radius: 8px;
+  font: 500 12px/1.3 system-ui, -apple-system, Segoe UI, Roboto;
+}
